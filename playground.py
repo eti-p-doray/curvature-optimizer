@@ -16,17 +16,18 @@ import jax
 import jax.numpy as jnp  # JAX NumPy
 
 jax.config.update("jax_traceback_filtering", 'off')
+#jax.config.update("jax_debug_nans", True)
 
 import optimizers
 import training
 
-def get_mnist_datasets(batch_size):
+def get_image_datasets(name, batch_size):
   """Load MNIST train and test datasets into memory."""
-  (train_ds, test_ds) = tfds.load('mnist', split=['train', 'test'], as_supervised=True)
+  (train_ds, test_ds) = tfds.load(name, split=['train', 'test'], as_supervised=True)
 
   def normalize_img(image, label):
     """Normalizes images: `uint8` -> `float32`."""
-    return tf.cast(image, tf.float32) / 255., label
+    return tf.cast(image, tf.float32) / 255., tf.cast(label, tf.int32)
 
   train_ds = train_ds.map(
     normalize_img, num_parallel_calls=tf.data.AUTOTUNE)
@@ -45,6 +46,7 @@ def get_mnist_datasets(batch_size):
 
 class CNN(nn.Module):
   """A simple CNN model."""
+  num_classes: int
 
   def setup(self):
     # Submodule names are derived by the attributes you assign to. In this
@@ -52,7 +54,7 @@ class CNN(nn.Module):
     self.conv1 = nn.Conv(features=32, kernel_size=(3, 3), kernel_init=jax.nn.initializers.glorot_normal())
     self.conv2 = nn.Conv(features=64, kernel_size=(3, 3), kernel_init=jax.nn.initializers.glorot_normal())
     self.dense1 = nn.Dense(features=256, kernel_init=jax.nn.initializers.glorot_normal())
-    self.dense2 = nn.Dense(features=10, kernel_init=jax.nn.initializers.glorot_normal())
+    self.dense2 = nn.Dense(features=self.num_classes, kernel_init=jax.nn.initializers.glorot_normal())
 
   def __call__(self, x):
     x = self.conv1(x)
@@ -67,11 +69,56 @@ class CNN(nn.Module):
     x = self.dense2(x)
     return x
 
-tf.random.set_seed(0)
+class VGG16(nn.Module):
+  num_classes: int
+  dropout_rate: float = 0.2
+  output: str='linear'
+  dtype: str='float32'
 
-cnn = CNN()
-rng = jax.random.PRNGKey(0)
-print(cnn.tabulate(rng, jnp.ones((1, 28, 28, 1))))
+  class ConvBlock(nn.Module):
+    features: int
+    num_layers: int
+    dtype: str
+
+    def setup(self):
+      layers = []
+      for l in range(self.num_layers):
+        layers.append(nn.Conv(features=self.features, kernel_size=(3, 3), padding='same', dtype=self.dtype, kernel_init=jax.nn.initializers.glorot_normal()))
+      self.layers = layers
+
+    def __call__(self, x):
+      for l in self.layers:
+        x = l(x)
+        x = nn.relu(x)
+      x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+      return x
+
+  def setup(self):
+    self.conv1 = self.ConvBlock(features=32, num_layers=2, dtype=self.dtype)
+    self.conv2 = self.ConvBlock(features=64, num_layers=2, dtype=self.dtype)
+    self.conv3 = self.ConvBlock(features=128, num_layers=2, dtype=self.dtype)
+    self.dense1 = nn.Dense(features=128, kernel_init=jax.nn.initializers.glorot_normal())
+    self.dense2 = nn.Dense(features=self.num_classes, kernel_init=jax.nn.initializers.glorot_normal())
+
+      
+  @nn.compact
+  def __call__(self, x, training=False):
+    if self.output not in ['softmax', 'log_softmax', 'sigmoid', 'linear', 'log_sigmoid']:
+        raise ValueError('Wrong argument. Possible choices for output are "softmax", "sigmoid", "log_sigmoid", "linear".')
+    
+    x = self.conv1(x)
+    x = self.conv2(x)
+    x = self.conv3(x)
+
+    x = x.reshape((x.shape[0], -1))  # flatten
+    
+    # Fully conected
+    #x = jnp.mean(x, axis=(2, 3))
+    x = self.dense1(x)
+    x = nn.relu(x)
+    #x = nn.BatchNorm()(x, use_running_average=not training)
+    x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not training) 
+    return self.dense2(x)
 
 @struct.dataclass
 class Metrics(metrics.Collection):
@@ -81,9 +128,9 @@ class Metrics(metrics.Collection):
 def crossentrop_loss(y_pred, y):
   return optax.softmax_cross_entropy_with_integer_labels(logits=y_pred, labels=y).sum()
 
-def create_mnist_train_state(module, rng, state_class, tx):
+def create_img_train_state(module, dims, rng, state_class, tx):
   """Creates an initial `TrainState`."""
-  params = module.init(rng, jnp.empty([1, 28, 28, 1]))['params'] # initialize parameters by passing a template image
+  params = module.init(rng, jnp.empty(dims))['params'] # initialize parameters by passing a template image
   opt_state = tx.init(params)
 
   return state_class(
@@ -94,16 +141,26 @@ def create_mnist_train_state(module, rng, state_class, tx):
       rng_key=rng,
       initial_metrics=Metrics)
 
-num_epochs = 10
+num_epochs = 2
 batch_size = 32
 
-train_ds, test_ds = get_mnist_datasets(batch_size)
 
-learning_rate = 0.01 / 32
-momentum = 0.9
+tf.random.set_seed(0)
 
-tx = optimizers.basic_kalman_trace_transformation(1.0, 0.5)
-state = create_mnist_train_state(cnn, jax.random.PRNGKey(0), training.NaturalTrainState, tx)
-#state = create_mnist_train_state(cnn, jax.random.PRNGKey(0), TrainState, optax.sgd(learning_rate, momentum))
+#module = CNN(10)
+module = VGG16(10)
+rng = jax.random.PRNGKey(0)
+dims = [1, 32, 32, 3]
+print(module.tabulate(rng, jnp.ones(dims)))
 
-training.train(train_ds, test_ds, state, num_epochs)
+tx = optimizers.kalman_blockwise_spectral_transformation(1.0, 1.0, 16, jax.random.PRNGKey(0))
+#tx = optimizers.kalman_blockwise_trace_transformation(1.0, 1.0)
+#tx = optax.sgd(0.01 / batch_size, 0.9)
+
+train_ds, test_ds = get_image_datasets('cifar10', batch_size)
+state = create_img_train_state(module, dims, jax.random.PRNGKey(1), training.NaturalTrainState, tx)
+#state = create_img_train_state(module, dims, jax.random.PRNGKey(1), training.TrainState, tx)
+
+#with jax.profiler.trace("./jax-trace", create_perfetto_trace=True):
+state = training.train(train_ds, test_ds, state, num_epochs)
+jax.block_until_ready(state)

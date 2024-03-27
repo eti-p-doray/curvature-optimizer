@@ -5,3 +5,4 @@ jax==0.4.16
 optax==0.1.5
 tensorflow==2.14.0
 tensorflow-datasets==4.9.2
+progress==1.6
