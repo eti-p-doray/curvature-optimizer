@@ -9,11 +9,8 @@ import jax.numpy as jnp  # JAX NumPy
 import optax
 import chex
 import clu
-
-def compute_metrics(metrics, *, loss, logits, labels):
-  metric_updates = metrics.single_from_model_output(
-    logits=logits, labels=labels, loss=loss)
-  return metrics.merge(metric_updates)
+import time
+import sys
 
 class TransformInitFn(Protocol):
   def __call__(self, params: chex.ArrayTree) -> chex.ArrayTree:
@@ -33,19 +30,11 @@ class ConsumeSampleFn(Protocol):
       params: chex.ArrayTree) -> chex.ArrayTree:
     ...
 
-class UpdateStepFn(Protocol):
-  def __call__(self,
-      state: chex.ArrayTree,
-      params: chex.ArrayTree) -> chex.ArrayTree:
-    ...
-
-
 @dataclass
 class NaturalGradientTransformation:
   init: TransformInitFn
   transform_update: TransformUpdateFn
   consume_sample: ConsumeSampleFn
-  update_step: UpdateStepFn
 
 @flax.struct.dataclass
 class TrainState:
@@ -53,11 +42,12 @@ class TrainState:
   tx: optax.GradientTransformation = flax.struct.field(pytree_node=False)
   loss_fn: Callable = flax.struct.field(pytree_node=False)
   loss_hessian_fn: Callable = flax.struct.field(pytree_node=False)
+  compute_metrics_fn: Callable = flax.struct.field(pytree_node=False)
 
   initial_metrics: clu.metrics.Collection = flax.struct.field(pytree_node=False)
   params: chex.ArrayTree
   opt_state: optax.OptState
-  rng_key: jax.random.KeyArray
+  rng_key: jax.random.PRNGKey
 
   @jax.jit
   def train_step(state, metrics, batch):
@@ -65,13 +55,13 @@ class TrainState:
     x, y = batch
     """Train for a single step."""
     def predict_and_loss_fn(params):
-      logits = state.apply_fn({'params': params}, x)
-      loss = state.loss_fn(logits, y)
-      return loss, logits
+      outputs = state.apply_fn({'params': params}, x)
+      loss = state.loss_fn(outputs, y)
+      return loss, outputs
     
     grad_fn = jax.value_and_grad(predict_and_loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
-    metrics = compute_metrics(metrics, loss=loss, logits=logits, labels=y)
+    (loss, outputs), grads = grad_fn(state.params)
+    metrics = state.compute_metrics_fn(metrics, loss=loss, outputs=outputs, labels=y)
 
     updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params)
     new_params = optax.apply_updates(state.params, updates)
@@ -84,50 +74,13 @@ class TrainState:
   @jax.jit
   def eval_step(state, metrics, batch):
     x, y = batch
-    logits = state.apply_fn({'params': state.params}, x)
-    loss = state.loss_fn(logits, y)
-    return compute_metrics(metrics, loss=loss, logits=logits, labels=y)
+    outputs = state.apply_fn({'params': state.params}, x)
+    loss = state.loss_fn(outputs, y)
+    return state.compute_metrics_fn(metrics, loss=loss, outputs=outputs, labels=y)
 
 @flax.struct.dataclass
 class NaturalTrainState(TrainState):
   tx: NaturalGradientTransformation = flax.struct.field(pytree_node=False)
-
-  """@jax.jit
-  def train_step(state, metrics, batch):
-    new_key, subkey = jax.random.split(state.rng_key)
-    x, y = batch
-
-    def predict_and_loss_fn(params):
-      logits = state.apply_fn({'params': params}, x)
-      loss = state.loss_fn(logits, y)
-      return loss, logits
-    
-    with jax.profiler.TraceAnnotation("value_and_grad"):
-      grad_fn = jax.value_and_grad(predict_and_loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
-
-    metrics = compute_metrics(metrics, loss=loss, logits=logits, labels=y)
-
-    def backward_sample(x, rng_key):
-      def predict(params):
-        return state.apply_fn({'params': params}, jnp.expand_dims(x, 0))
-      logits, vjp_fun = jax.vjp(predict, state.params)
-      sample = state.loss_hessian_fn(logits, jax.random.normal(rng_key, logits.shape))
-      return vjp_fun(sample)[0]
-    
-    with jax.profiler.TraceAnnotation("backward_sample"):
-      #information_samples = jax.vmap(backward_sample)(x, loss_hessian_samples)
-      information_samples = jax.tree_util.tree_map(lambda x: jnp.expand_dims(x,0), backward_sample(x[0,...], subkey))
-
-    updates, new_opt_state = state.tx.transform_update(grads, state.opt_state, state.params)
-
-    new_opt_state = state.tx.consume_sample(information_samples, new_opt_state, state.params)
-    new_params = optax.apply_updates(state.params, updates)
-    return state.replace(
-        params=new_params,
-        opt_state=new_opt_state,
-        rng_key=new_key
-    ), metrics"""
   
   @jax.profiler.annotate_function
   @jax.jit
@@ -137,19 +90,20 @@ class NaturalTrainState(TrainState):
 
     def predict(params):
       return state.apply_fn({'params': params}, x)
-    def loss(logits):
-      return state.loss_fn(logits, y)
+    def loss(outputs):
+      return state.loss_fn(outputs, y) 
     
-    logits, grad_fn = jax.vjp(predict, state.params)
+    outputs, grad_fn = jax.vjp(predict, state.params)
     loss_grad_fn = jax.value_and_grad(loss)
-    loss, loss_grad = loss_grad_fn(logits)
+    loss, loss_grad = loss_grad_fn(outputs)
     grads = grad_fn(loss_grad)[0]
 
-    samples = jax.random.normal(subkey, logits.shape)
-    samples = jax.vmap(state.loss_hessian_fn)(logits, samples)
+    # Map the random.normal across each component of the output 
+    samples = jax.tree_map(lambda output: jax.random.normal(subkey, jnp.shape(output)), outputs)
+    samples = state.loss_hessian_fn(outputs, samples)
     samples = grad_fn(samples)[0]
 
-    metrics = compute_metrics(metrics, loss=loss, logits=logits, labels=y)
+    metrics = state.compute_metrics_fn(metrics, loss=loss, outputs=outputs, labels=y)
     updates, new_opt_state = state.tx.transform_update(grads, state.opt_state, state.params)
     new_params = optax.apply_updates(state.params, updates)
     new_opt_state = state.tx.consume_sample(samples, new_opt_state, state.params)
@@ -159,35 +113,67 @@ class NaturalTrainState(TrainState):
         rng_key=new_key
     ), metrics
   
+  @jax.jit
   def train_step(state, metrics, batch):
     state, metrics = state.train_step_impl(metrics, batch)
-    new_opt_state = state.tx.update_step(state.opt_state, state.params)
-    return state.replace(opt_state=new_opt_state), metrics
+    return state, metrics
 
-def train(train_ds, test_ds, state, epochs):
-  for epoch in range(epochs):
-    metrics = state.initial_metrics.empty()
-    
-    #if epoch > 0:
-      #jax.profiler.start_trace("./jax-trace", create_perfetto_trace=True)
-    
-    start = perf_counter()
-    with Bar('Training', max=train_ds.cardinality().numpy()) as bar:
-      for i, batch in enumerate(train_ds.as_numpy_iterator()):
-        # Run optimization steps over training batches and compute batch metrics
-        state, metrics = state.train_step(metrics, batch) # get updated train state (which contains the updated parameters)
-        bar.next()
-    jax.block_until_ready(state)
-    print("Elapsed time:", perf_counter() - start) 
-    for metric,value in metrics.compute().items():
-      print(f'Train {metric}: {value}')
-
-    metrics = state.initial_metrics.empty()
-    for batch in test_ds.as_numpy_iterator():
-      metrics = state.eval_step(metrics, batch) # aggregate batch metrics
-    for metric,value in metrics.compute().items():
-      print(f'Test {metric}: {value}')
-
+def train(train_ds, state, cardinality):    
+  metrics = state.initial_metrics.empty()
+  start = perf_counter()
+  with Bar('Training', max=cardinality) as bar:
+    for batch in train_ds:
+      # Run optimization steps over training batches and compute batch metrics
+      state, metrics = state.train_step(metrics, batch) # get updated train state (which contains the updated parameters)
+      bar.next()
   jax.block_until_ready(state)
-  #jax.profiler.stop_trace()
+  print("Elapsed time:", perf_counter() - start) 
+  for metric,value in metrics.compute().items():
+    print(f'Train {metric}: {value}')
   return state
+
+def train_with_eval(train_ds, state, cardinality, test_ds=None, eval_every=100, test_batches=10, start_time=None):
+    metrics = state.initial_metrics.empty()
+    start = time.perf_counter()
+    batch_count = 0
+    
+    with Bar('Training', max=cardinality) as bar:
+        for batch in train_ds:
+            state, metrics = state.train_step(metrics, batch)
+            bar.next()
+            batch_count += 1
+            
+            if batch_count % eval_every == 0:
+                if start_time:
+                    current_time = time.time()
+                    elapsed_time = (current_time - start_time) / 60  # Time in minutes
+                    print(f"\nElapsed Time: {elapsed_time:.2f} minutes")
+                
+                print(f"\nEvaluating on test set after {batch_count} batches...")
+                test_metrics = eval_test_subset(test_ds, state, test_batches)
+                print(f"Test Loss after {batch_count} batches: {test_metrics['loss']}")
+                sys.stdout.flush()
+    jax.block_until_ready(state)
+    print("Elapsed time for training:", time.perf_counter() - start)
+    for metric, value in metrics.compute().items():
+        print(f'Train {metric}: {value}')
+    return state
+
+
+def eval_test_subset(test_ds, state, num_batches):
+    metrics = state.initial_metrics.empty()
+    batch_counter = 0
+    for batch in test_ds:
+        if batch_counter >= num_batches:
+            break
+        metrics = state.eval_step(metrics, batch)
+        batch_counter += 1
+    return metrics.compute()
+
+
+def test(test_ds, state):
+  metrics = state.initial_metrics.empty()
+  for batch in test_ds:
+    metrics = state.eval_step(metrics, batch) # aggregate batch metrics
+  for metric,value in metrics.compute().items():
+    print(f'Test {metric}: {value}')

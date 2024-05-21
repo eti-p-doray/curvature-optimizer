@@ -3,17 +3,15 @@ import tensorflow as tf             # TensorFlow operations
 from typing import Callable, Any, Protocol, Tuple, NamedTuple
 from dataclasses import dataclass
 
+import jax
+import jax.numpy as jnp  # JAX NumPy
+
 from flax import linen as nn  # Linen API
 
 from clu import metrics
-from flax.training import train_state  # Useful dataclass to keep train state
-from flax import core
 from flax import struct
 import optax                           # Common loss functions and optimizers
 import chex
-
-import jax
-import jax.numpy as jnp  # JAX NumPy
 
 jax.config.update("jax_traceback_filtering", 'off')
 #jax.config.update("jax_debug_nans", True)
@@ -141,7 +139,7 @@ def create_img_train_state(module, dims, rng, state_class, tx):
       rng_key=rng,
       initial_metrics=Metrics)
 
-num_epochs = 2
+num_epochs = 10
 batch_size = 32
 
 
@@ -153,14 +151,20 @@ rng = jax.random.PRNGKey(0)
 dims = [1, 32, 32, 3]
 print(module.tabulate(rng, jnp.ones(dims)))
 
-tx = optimizers.kalman_blockwise_spectral_transformation(1.0, 1.0, 16, jax.random.PRNGKey(0))
+tx = optimizers.kalman_blockwise_spectral_transformation(1.0, 1.0, 16, 48, jax.random.PRNGKey(0))
 #tx = optimizers.kalman_blockwise_trace_transformation(1.0, 1.0)
-#tx = optax.sgd(0.01 / batch_size, 0.9)
+#tx = optax.sgd(0.005 / batch_size, 0.9)
 
 train_ds, test_ds = get_image_datasets('cifar10', batch_size)
 state = create_img_train_state(module, dims, jax.random.PRNGKey(1), training.NaturalTrainState, tx)
 #state = create_img_train_state(module, dims, jax.random.PRNGKey(1), training.TrainState, tx)
 
-#with jax.profiler.trace("./jax-trace", create_perfetto_trace=True):
-state = training.train(train_ds, test_ds, state, num_epochs)
-jax.block_until_ready(state)
+enable_tracing= False
+for epoch in range(num_epochs):
+  if epoch > 0 and enable_tracing:
+    jax.profiler.start_trace("./jax-trace", create_perfetto_trace=True)
+  state = training.train(train_ds.as_numpy_iterator(), state, train_ds.cardinality().numpy())
+  training.test(test_ds.as_numpy_iterator(), state)
+
+if enable_tracing:
+  jax.profiler.stop_trace()

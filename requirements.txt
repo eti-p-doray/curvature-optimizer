@@ -1,8 +1,10 @@
-chex==0.1.8
-clu==0.0.9
-flax==0.6.11
-jax==0.4.16
-optax==0.1.5
-tensorflow==2.14.0
+chex==0.1.86
+clu==0.0.4
+flax==0.8.2
+jax==0.4.25
+optax==0.2.1
+tensorflow==2.15.1
 tensorflow-datasets==4.9.2
 progress==1.6
+datasets==2.18.0
+tokenizers==0.15.0
